@@ -27,5 +27,9 @@ jobs:
 
       - name: Build and push Docker Compose images
         run: |
+          # 設置環境變數（可選，根據需要調整）
+          export COMPOSE_DOCKER_CLI_BUILD=1
+          export DOCKER_BUILDKIT=1
+          # 構建並推送所有服務的镜像
           docker-compose -f docker-compose.yaml build
           docker-compose -f docker-compose.yaml push
