@@ -5,10 +5,9 @@ import {
   RunWebScraperResult,
 } from "../types";
 import { billTeam } from "../services/billing/credit_billing";
-import { Document } from "../controllers/v1/types";
+import { Document, TeamFlags } from "../controllers/v1/types";
 import { supabase_service } from "../services/supabase";
 import { logger as _logger } from "../lib/logger";
-import { ScrapeEvents } from "../lib/scrape-events";
 import { configDotenv } from "dotenv";
 import {
   EngineResultsTracker,
@@ -16,15 +15,15 @@ import {
   ScrapeUrlResponse,
 } from "../scraper/scrapeURL";
 import { Engine } from "../scraper/scrapeURL/engines";
-import { indexPage } from "../lib/extract/index/pinecone";
+import { CostTracking } from "../lib/extract/extraction-service";
 configDotenv();
 
 export async function startWebScraperPipeline({
   job,
-  token,
+  costTracking,
 }: {
   job: Job<WebScraperOptions> & { id: string };
-  token: string;
+  costTracking: CostTracking;
 }) {
   return await runWebScraper({
     url: job.data.url,
@@ -37,21 +36,18 @@ export async function startWebScraperPipeline({
           }
         : {}),
     },
-    internalOptions: job.data.internalOptions,
-    // onSuccess: (result, mode) => {
-    //   logger.debug(`🐂 Job completed ${job.id}`);
-    //   saveJob(job, result, token, mode);
-    // },
-    // onError: (error) => {
-    //   logger.error(`🐂 Job failed ${job.id}`);
-    //   ScrapeEvents.logJobEvent(job, "failed");
-    // },
+    internalOptions: {
+      crawlId: job.data.crawl_id,
+      teamId: job.data.team_id,
+      ...job.data.internalOptions,
+    },
     team_id: job.data.team_id,
     bull_job_id: job.id.toString(),
     priority: job.opts.priority,
     is_scrape: job.data.is_scrape ?? false,
     is_crawl: !!(job.data.crawl_id && job.data.crawlerOptions !== null),
     urlInvisibleInCurrentCrawl: job.data.crawlerOptions?.urlInvisibleInCurrentCrawl ?? false,
+    costTracking,
   });
 }
 
@@ -60,22 +56,24 @@ export async function runWebScraper({
   mode,
   scrapeOptions,
   internalOptions,
-  // onSuccess,
-  // onError,
   team_id,
   bull_job_id,
   priority,
   is_scrape = false,
   is_crawl = false,
   urlInvisibleInCurrentCrawl = false,
+  costTracking,
 }: RunWebScraperParams): Promise<ScrapeUrlResponse> {
   const logger = _logger.child({
     method: "runWebScraper",
     module: "runWebscraper",
     scrapeId: bull_job_id,
     jobId: bull_job_id,
+    zeroDataRetention: internalOptions?.zeroDataRetention,
   });
   const tries = is_crawl ? 3 : 1;
+
+  logger.info("runWebScraper called");
 
   let response: ScrapeUrlResponse | undefined = undefined;
   let engines: EngineResultsTracker = {};
@@ -96,12 +94,13 @@ export async function runWebScraper({
     error = undefined;
 
     try {
+      logger.info("running scrapeURL...");
       response = await scrapeURL(bull_job_id, url, scrapeOptions, {
         priority,
         ...internalOptions,
         urlInvisibleInCurrentCrawl,
         teamId: internalOptions?.teamId ?? team_id,
-      });
+      }, costTracking);
       if (!response.success) {
         if (response.error instanceof Error) {
           throw response.error;
@@ -116,9 +115,6 @@ export async function runWebScraper({
           );
         }
       }
-
-      // This is where the returnvalue from the job is set
-      // onSuccess(response.document, mode);
 
       engines = response.engines;
 
@@ -141,35 +137,35 @@ export async function runWebScraper({
     }
   }
 
-  const engineOrder = Object.entries(engines)
-    .sort((a, b) => a[1].startedAt - b[1].startedAt)
-    .map((x) => x[0]) as Engine[];
+  // const engineOrder = Object.entries(engines)
+  //   .sort((a, b) => a[1].startedAt - b[1].startedAt)
+  //   .map((x) => x[0]) as Engine[];
 
-  for (const engine of engineOrder) {
-    const result = engines[engine] as Exclude<
-      EngineResultsTracker[Engine],
-      undefined
-    >;
-    ScrapeEvents.insert(bull_job_id, {
-      type: "scrape",
-      url,
-      method: engine,
-      result: {
-        success: result.state === "success",
-        response_code:
-          result.state === "success" ? result.result.statusCode : undefined,
-        response_size:
-          result.state === "success" ? result.result.html.length : undefined,
-        error:
-          result.state === "error"
-            ? result.error
-            : result.state === "timeout"
-              ? "Timed out"
-              : undefined,
-        time_taken: result.finishedAt - result.startedAt,
-      },
-    });
-  }
+  // for (const engine of engineOrder) {
+  //   const result = engines[engine] as Exclude<
+  //     EngineResultsTracker[Engine],
+  //     undefined
+  //   >;
+  //   ScrapeEvents.insert(bull_job_id, {
+  //     type: "scrape",
+  //     url,
+  //     method: engine,
+  //     result: {
+  //       success: result.state === "success",
+  //       response_code:
+  //         result.state === "success" ? result.result.statusCode : undefined,
+  //       response_size:
+  //         result.state === "success" ? result.result.html.length : undefined,
+  //       error:
+  //         result.state === "error"
+  //           ? result.error
+  //           : result.state === "timeout"
+  //             ? "Timed out"
+  //             : undefined,
+  //       time_taken: result.finishedAt - result.startedAt,
+  //     },
+  //   });
+  // }
 
   if (error === undefined && response?.success) {
     return response;
@@ -194,7 +190,6 @@ export async function runWebScraper({
 const saveJob = async (
   job: Job,
   result: any,
-  token: string,
   mode: string,
   engines?: EngineResultsTracker,
 ) => {
@@ -223,7 +218,7 @@ const saveJob = async (
       //     // I think the job won't exist here anymore
       //   }
     }
-    ScrapeEvents.logJobEvent(job, "completed");
+    // ScrapeEvents.logJobEvent(job, "completed");
   } catch (error) {
     _logger.error(`🐂 Failed to update job status`, {
       module: "runWebScraper",

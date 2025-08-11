@@ -7,12 +7,15 @@ import {
   buildShouldExtractUserPrompt,
 } from "../build-prompts";
 import { getModel } from "../../../lib/generic-ai";
+import { CostTracking } from "../extraction-service";
 
 export async function checkShouldExtract(
   prompt: string,
   multiEntitySchema: any,
   doc: Document,
-): Promise<{ tokenUsage: TokenUsage; extract: boolean }> {
+  costTracking: CostTracking,
+  metadata: { teamId: string, functionId?: string, extractId?: string, scrapeId?: string, deepResearchId?: string },
+): Promise<{ tokenUsage: TokenUsage; extract: boolean; }> {
   const shouldExtractCheck = await generateCompletions({
     logger: logger.child({ method: "extractService/checkShouldExtract" }),
     options: {
@@ -31,7 +34,18 @@ export async function checkShouldExtract(
     },
     markdown: buildDocument(doc),
     isExtractEndpoint: true,
-    model: getModel("gpt-4o-mini"),
+    model: getModel("gpt-4o-mini", "openai"),
+    costTrackingOptions: {
+      costTracking,
+      metadata: {
+        module: "extract",
+        method: "checkShouldExtract",
+      },
+    },
+    metadata: {
+      ...metadata,
+      functionId: metadata.functionId ? (metadata.functionId + "/checkShouldExtract") : "checkShouldExtract",
+    },
   });
 
   return {

@@ -1,5 +1,5 @@
 import { Request, Response } from "express";
-import { extractOptions, RequestWithAuth } from "./types";
+import { ErrorResponse, extractOptions, RequestWithAuth } from "./types";
 import { getDeepResearchQueue } from "../../services/queue-service";
 import * as Sentry from "@sentry/node";
 import { saveDeepResearch } from "../../lib/deep-research/deep-research-redis";
@@ -31,7 +31,7 @@ export const deepResearchRequestSchema = z.object({
 
 export type DeepResearchRequest = z.infer<typeof deepResearchRequestSchema>;
 
-export type DeepResearchResponse = {
+export type DeepResearchResponse = ErrorResponse | {
   success: boolean;
   id: string;
 };
@@ -46,13 +46,16 @@ export async function deepResearchController(
   req: RequestWithAuth<{}, DeepResearchResponse, DeepResearchRequest>,
   res: Response<DeepResearchResponse>,
 ) {
+  if (req.acuc?.flags?.forceZDR) {
+    return res.status(400).json({ success: false, error: "Your team has zero data retention enabled. This is not supported on deep research. Please contact support@firecrawl.com to unblock this feature." });
+  }
+
   req.body = deepResearchRequestSchema.parse(req.body);
 
   const researchId = crypto.randomUUID();
   const jobData = {
     request: req.body,
     teamId: req.auth.team_id,
-    plan: req.auth.plan,
     subId: req.acuc?.sub_id,
     researchId,
   };
@@ -60,7 +63,6 @@ export async function deepResearchController(
   await saveDeepResearch(researchId, {
     id: researchId,
     team_id: req.auth.team_id,
-    plan: req.auth.plan,
     createdAt: Date.now(),
     status: "processing",
     currentDepth: 0,
@@ -73,34 +75,9 @@ export async function deepResearchController(
     summaries: [],
   });
 
-  if (Sentry.isInitialized()) {
-    const size = JSON.stringify(jobData).length;
-    await Sentry.startSpan(
-      {
-        name: "Add deep research job",
-        op: "queue.publish",
-        attributes: {
-          "messaging.message.id": researchId,
-          "messaging.destination.name": getDeepResearchQueue().name,
-          "messaging.message.body.size": size,
-        },
-      },
-      async (span) => {
-        await getDeepResearchQueue().add(researchId, {
-          ...jobData,
-          sentry: {
-            trace: Sentry.spanToTraceHeader(span),
-            baggage: Sentry.spanToBaggageHeader(span),
-            size,
-          },
-        }, { jobId: researchId });
-      },
-    );
-  } else {
-    await getDeepResearchQueue().add(researchId, jobData, {
-      jobId: researchId,
-    });
-  }
+  await getDeepResearchQueue().add(researchId, jobData, {
+    jobId: researchId,
+  });
 
   return res.status(200).json({
     success: true,
